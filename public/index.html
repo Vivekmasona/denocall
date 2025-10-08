@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Deno WebRTC Call</title>
+  <style>
+    body { font-family: sans-serif; text-align: center; background: #121212; color: white; }
+    video { width: 45%; border-radius: 12px; margin: 8px; background: #000; }
+    input, button { padding: 8px; margin: 5px; border-radius: 8px; border: none; }
+    button { background: #1db954; color: white; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>📞 Deno WebRTC Realtime Call</h2>
+  <input id="room" placeholder="Enter Room ID">
+  <button onclick="join()">Join Room</button>
+  <div>
+    <video id="local" autoplay muted playsinline></video>
+    <video id="remote" autoplay playsinline></video>
+  </div>
+
+  <script>
+    const wsUrl = "wss://YOUR-DENO-URL-HERE.deno.dev"; // <-- change this
+    let ws, pc, room;
+
+    async function join() {
+      room = document.getElementById("room").value.trim();
+      if (!room) return alert("Enter a room ID first");
+
+      ws = new WebSocket(wsUrl);
+      ws.onopen = () => ws.send(JSON.stringify({ join: room }));
+      ws.onmessage = async (e) => {
+        const data = JSON.parse(e.data);
+        if (data.offer) {
+          await pc.setRemoteDescription(data.offer);
+          const ans = await pc.createAnswer();
+          await pc.setLocalDescription(ans);
+          ws.send(JSON.stringify({ to: room, answer: ans }));
+        } else if (data.answer) {
+          await pc.setRemoteDescription(data.answer);
+        } else if (data.candidate) {
+          try { await pc.addIceCandidate(data.candidate); } catch (err) {}
+        }
+      };
+
+      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      document.getElementById("local").srcObject = stream;
+
+      pc = new RTCPeerConnection({
+        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+      });
+
+      stream.getTracks().forEach(track => pc.addTrack(track, stream));
+      pc.ontrack = (event) => {
+        document.getElementById("remote").srcObject = event.streams[0];
+      };
+
+      pc.onicecandidate = (event) => {
+        if (event.candidate) ws.send(JSON.stringify({ to: room, candidate: event.candidate }));
+      };
+
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      ws.send(JSON.stringify({ to: room, offer }));
+    }
+  </script>
+</body>
+</html>
