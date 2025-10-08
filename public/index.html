@@ -2,67 +2,79 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8" />
-  <title>Deno WebRTC Call</title>
+  <title>Live Voice Call</title>
   <style>
-    body { font-family: sans-serif; text-align: center; background: #121212; color: white; }
-    video { width: 45%; border-radius: 12px; margin: 8px; background: #000; }
-    input, button { padding: 8px; margin: 5px; border-radius: 8px; border: none; }
-    button { background: #1db954; color: white; cursor: pointer; }
+    body {
+      font-family: Arial;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      gap: 10px;
+      background: #111;
+      color: #fff;
+    }
+    button {
+      padding: 10px 20px;
+      font-size: 18px;
+      background: #28a745;
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
   </style>
 </head>
 <body>
-  <h2>📞 Deno WebRTC Realtime Call</h2>
-  <input id="room" placeholder="Enter Room ID">
-  <button onclick="join()">Join Room</button>
-  <div>
-    <video id="local" autoplay muted playsinline></video>
-    <video id="remote" autoplay playsinline></video>
-  </div>
+  <h1>🔊 Real-Time Voice Call</h1>
+  <button id="startBtn">Start Call</button>
+  <p id="status">Waiting to connect...</p>
 
   <script>
-    const wsUrl = "wss://YOUR-DENO-URL-HERE.deno.dev"; // <-- change this
-    let ws, pc, room;
+    const ws = new WebSocket("wss://" + location.host + "/ws");
+    const peer = new RTCPeerConnection();
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
 
-    async function join() {
-      room = document.getElementById("room").value.trim();
-      if (!room) return alert("Enter a room ID first");
+    let localStream;
 
-      ws = new WebSocket(wsUrl);
-      ws.onopen = () => ws.send(JSON.stringify({ join: room }));
-      ws.onmessage = async (e) => {
-        const data = JSON.parse(e.data);
-        if (data.offer) {
-          await pc.setRemoteDescription(data.offer);
-          const ans = await pc.createAnswer();
-          await pc.setLocalDescription(ans);
-          ws.send(JSON.stringify({ to: room, answer: ans }));
-        } else if (data.answer) {
-          await pc.setRemoteDescription(data.answer);
-        } else if (data.candidate) {
-          try { await pc.addIceCandidate(data.candidate); } catch (err) {}
-        }
-      };
+    ws.onmessage = async (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.offer) {
+        await peer.setRemoteDescription(new RTCSessionDescription(msg.offer));
+        const answer = await peer.createAnswer();
+        await peer.setLocalDescription(answer);
+        ws.send(JSON.stringify({ answer }));
+      } else if (msg.answer) {
+        await peer.setRemoteDescription(new RTCSessionDescription(msg.answer));
+      } else if (msg.candidate) {
+        await peer.addIceCandidate(new RTCIceCandidate(msg.candidate));
+      }
+    };
 
-      const stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
-      document.getElementById("local").srcObject = stream;
+    peer.onicecandidate = (event) => {
+      if (event.candidate) {
+        ws.send(JSON.stringify({ candidate: event.candidate }));
+      }
+    };
 
-      pc = new RTCPeerConnection({
-        iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
-      });
+    peer.ontrack = (event) => {
+      const audio = document.createElement("audio");
+      audio.srcObject = event.streams[0];
+      audio.autoplay = true;
+      document.body.appendChild(audio);
+    };
 
-      stream.getTracks().forEach(track => pc.addTrack(track, stream));
-      pc.ontrack = (event) => {
-        document.getElementById("remote").srcObject = event.streams[0];
-      };
-
-      pc.onicecandidate = (event) => {
-        if (event.candidate) ws.send(JSON.stringify({ to: room, candidate: event.candidate }));
-      };
-
-      const offer = await pc.createOffer();
-      await pc.setLocalDescription(offer);
-      ws.send(JSON.stringify({ to: room, offer }));
-    }
+    startBtn.onclick = async () => {
+      localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      localStream.getTracks().forEach(track => peer.addTrack(track, localStream));
+      const offer = await peer.createOffer();
+      await peer.setLocalDescription(offer);
+      ws.send(JSON.stringify({ offer }));
+      statusEl.textContent = "🎤 Connected. Speak now!";
+      startBtn.disabled = true;
+    };
   </script>
 </body>
 </html>
