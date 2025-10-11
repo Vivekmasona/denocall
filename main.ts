@@ -1,4 +1,4 @@
-// Working lightweight YouTube fetcher for Deno Deploy
+// Deno YouTube Extractor - Full Version
 // Example: https://yourapp.deno.dev/ytdlp?url=https://youtu.be/FkFvdukWpAI
 
 Deno.serve(async (req) => {
@@ -21,20 +21,21 @@ Deno.serve(async (req) => {
     }
 
     try {
+      // Fetch video page HTML
       const res = await fetch(ytUrl);
       const html = await res.text();
 
-      // Extract video title
+      // Extract video title from <title> tag
       const titleMatch = html.match(/<title>(.*?)<\/title>/i);
       const title = titleMatch ? titleMatch[1].replace(" - YouTube", "") : "Unknown";
 
-      // Extract basic player config
+      // Extract ytInitialPlayerResponse JSON
       const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
       if (!playerMatch) {
         return new Response(JSON.stringify({
           status: "ok",
           title,
-          message: "Could not parse player response (no ytInitialPlayerResponse found)",
+          message: "Could not parse player response (ytInitialPlayerResponse not found)",
         }), {
           headers: { "content-type": "application/json" },
         });
@@ -44,17 +45,36 @@ Deno.serve(async (req) => {
       const formats = playerJson?.streamingData?.formats || [];
       const adaptive = playerJson?.streamingData?.adaptiveFormats || [];
 
-      // Try to pick one playable audio URL
+      // Pick one playable audio URL
       const audio =
         adaptive.find((f: any) => f.mimeType.includes("audio")) ||
         formats.find((f: any) => f.mimeType.includes("audio"));
 
+      // Extract additional info
+      const videoDetails = playerJson.videoDetails || {};
+      const microformat = playerJson.microformat?.playerMicroformatRenderer || {};
+
+      const channelName = videoDetails.author || "Unknown";
+      const channelId = videoDetails.channelId || "Unknown";
+      const durationSeconds = parseInt(videoDetails.lengthSeconds || "0", 10);
+      const description = videoDetails.shortDescription || "";
+      const thumbnails = videoDetails.thumbnail?.thumbnails || [];
+      const publishDate = microformat.publishDate || "";
+      const viewCount = videoDetails.viewCount || "0";
+
       return new Response(JSON.stringify({
         status: "success",
         title,
-        videoId: playerJson.videoDetails?.videoId,
+        videoId: videoDetails.videoId,
+        channelName,
+        channelId,
+        description,
+        publishDate,
+        viewCount,
+        durationSeconds,
+        thumbnails,
         audioUrl: audio?.url || "N/A",
-        formats: (formats.length + adaptive.length),
+        formatsCount: formats.length + adaptive.length,
       }, null, 2), {
         headers: { "content-type": "application/json" },
       });
