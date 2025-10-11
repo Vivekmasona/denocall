@@ -12,32 +12,56 @@ serve(async (req) => {
   }
 
   try {
-    // RapidAPI / no-key fallback public endpoint (no binary needed)
-    const apiUrl = `https://pipedapi.kavin.rocks/streams/${extractVideoId(url)}`;
-    const res = await fetch(apiUrl);
-    const data = await res.json();
+    // Run yt-dlp with JSON dump
+    const process = Deno.run({
+      cmd: ["yt-dlp", "--dump-json", url],
+      stdout: "piped",
+      stderr: "piped",
+    });
 
-    const audio = data.audioStreams?.sort((a: any, b: any) => b.bitrate - a.bitrate)[0];
+    const output = await process.output();
+    const errorOutput = await process.stderrOutput();
+    const status = await process.status();
 
+    process.close();
+
+    if (!status.success) {
+      const errText = new TextDecoder().decode(errorOutput);
+      return new Response(
+        JSON.stringify({ status: "error", message: errText }),
+        { headers: { "Content-Type": "application/json" }, status: 500 }
+      );
+    }
+
+    const jsonText = new TextDecoder().decode(output);
+    const data = JSON.parse(jsonText);
+
+    // Pick best audio URL
+    let audioUrl = "N/A";
+    if (data.formats && data.formats.length) {
+      const audioFormats = data.formats.filter((f: any) => f.acodec !== "none");
+      if (audioFormats.length) {
+        // Sort by bitrate or preference
+        audioFormats.sort((a: any, b: any) => (b.abr || 0) - (a.abr || 0));
+        audioUrl = audioFormats[0].url;
+      }
+    }
+
+    const result = {
+      status: "success",
+      title: data.title,
+      videoId: data.id,
+      audioUrl,
+      formats: data.formats?.length || 0,
+    };
+
+    return new Response(JSON.stringify(result, null, 2), {
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
     return new Response(
-      JSON.stringify({
-        status: "success",
-        title: data.title || "Unknown Title",
-        videoId: data.id || extractVideoId(url),
-        audioUrl: audio?.url || "N/A",
-        formats: data.audioStreams?.length || 0,
-      }),
-      { headers: { "Content-Type": "application/json" } }
-    );
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ status: "error", message: e.message }),
+      JSON.stringify({ status: "error", message: err.message }),
       { headers: { "Content-Type": "application/json" }, status: 500 }
     );
   }
 });
-
-function extractVideoId(url: string) {
-  const match = url.match(/(?:v=|youtu\.be\/)([a-zA-Z0-9_-]{11})/);
-  return match ? match[1] : url;
-}
