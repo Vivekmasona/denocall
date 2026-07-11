@@ -1,4 +1,4 @@
-// Deno Deploy Compatible - Pure yt-dlp JSON Stream Extractor (Instagram, Facebook, YouTube)
+// Deno Deploy Multi-Extractor: Direct Facebook & Instagram Parser with CORS
 
 Deno.serve(async (req) => {
   const { pathname, searchParams } = new URL(req.url);
@@ -27,61 +27,92 @@ Deno.serve(async (req) => {
     }
 
     try {
-      // Yeh direct yt-dlp engine wrapper hai jo online query execute karta hai
-      const ytdlpWrapperUrl = `https://noembed.com/embed?url=${encodeURIComponent(targetUrl)}`;
-      
-      // Asli raw parsing ke liye hum trusted public instances ka use kar rahe hain jo pure yt-dlp JSON output dete hain
-      const backupYtDlpApi = `https://api.allorigins.win/get?url=${encodeURIComponent(
-        `https://pub-ytdlp.yt-dlp.workers.dev/?url=${targetUrl}`
-      )}`;
+      // Kisi bhi bot blocker ko bypass karne ke liye generic User-Agent
+      const fetchHeaders = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+      };
 
-      // Direct instance call jo pure yt-dlp data return karegi
-      const res = await fetch(`https://jaeger.api.stdlib.com/yt-dlp@0.1.3/json/?url=${encodeURIComponent(targetUrl)}`);
+      const res = await fetch(targetUrl, { headers: fetchHeaders });
+      const html = await res.text();
+
+      let videoUrlHD = "";
+      let videoUrlSD = "";
+      let title = "Social Media Video";
+      let thumbnail = "";
+
+      // ---------------- FACEBOOK PARSING ENGINE ----------------
+      if (targetUrl.includes("facebook.com") || targetUrl.includes("fb.watch") || targetUrl.includes("share/r")) {
+        // Facebook ke graph/source se HD aur SD video links extract karna
+        const hdMatch = html.match(/"browser_native_hd_url":"([^"]+)"/) || html.match(/hd_src:"([^"]+)"/);
+        const sdMatch = html.match(/"browser_native_sd_url":"([^"]+)"/) || html.match(/sd_src:"([^"]+)"/);
+        const titleMatch = html.match(/<title>(.*?)<\/title>/);
+        const thumbMatch = html.match(/"preferred_thumbnail":{"image":{"uri":"([^"]+)"/);
+
+        if (hdMatch) videoUrlHD = JSON.parse(`"${hdMatch[1]}"`); // Clean unicode escapes
+        if (sdMatch) videoUrlSD = JSON.parse(`"${sdMatch[1]}"`);
+        if (titleMatch) title = titleMatch[1];
+        if (thumbMatch) thumbnail = JSON.parse(`"${thumbMatch[1]}"`);
+      } 
       
-      if (!res.ok) {
-        throw new Error("yt-dlp microservice response error");
+      // ---------------- INSTAGRAM PARSING ENGINE ----------------
+      else if (targetUrl.includes("instagram.com")) {
+        // Instagram og:video tags ya meta data formats check karta hai
+        const instaMatch = html.match(/<meta property="og:video" content="([^"]+)"/) || html.match(/"video_url":"([^"]+)"/);
+        const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
+        const thumbMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
+
+        if (instaMatch) videoUrlHD = instaMatch[1].replace(/&amp;/g, "&");
+        if (titleMatch) title = titleMatch[1];
+        if (thumbMatch) thumbnail = thumbMatch[1].replace(/&amp;/g, "&");
       }
 
-      const ytData = await res.json();
+      // Agar koi direct link nahi mila toh check generic video tags
+      if (!videoUrlHD && !videoUrlSD) {
+        const genericMatch = html.match(/<meta property="og:video:url" content="([^"]+)"/);
+        if (genericMatch) videoUrlHD = genericMatch[1];
+      }
 
-      // Agar data wrapper ke andar wrapped hai toh use extract karo, nahi toh direct use karo
-      const finalJson = ytData.info || ytData;
+      // Final response build jo aapke format list se match karega
+      const formats = [];
+      if (videoUrlHD) {
+        formats.push({
+          format_id: "HD / Best",
+          url: videoUrlHD,
+          ext: "mp4",
+          resolution: "High Quality"
+        });
+      }
+      if (videoUrlSD) {
+        formats.push({
+          format_id: "SD / Standard",
+          url: videoUrlSD,
+          ext: "mp4",
+          resolution: "Standard Quality"
+        });
+      }
 
-      // Ab aapko milega pure raw yt-dlp ka structure aapke responsive data ke sath!
+      if (formats.length === 0) {
+        throw new Error("Could not find any downloadable video stream in page source.");
+      }
+
       const response = {
-        kind: "youtube#videoListResponse",
-        extractor: finalJson.extractor || "generic",
-        title: finalJson.title || "Unknown Title",
-        thumbnail: finalJson.thumbnail || "",
-        duration: finalJson.duration || 0,
-        // Instagram/FB ke liye direct standard format url
-        direct_url: finalJson.url || "", 
-        // Saare adaptive (video-only / audio-only) formats ka poora access
-        formats: finalJson.formats?.map((f) => ({
-          format_id: f.format_id,
-          url: f.url,
-          ext: f.ext,
-          resolution: f.resolution || `${f.width}x${f.height}`,
-          fps: f.fps || null,
-          vcodec: f.vcodec,
-          acodec: f.acodec,
-          filesize: f.filesize || f.filesize_approx || "Unknown"
-        })) || []
+        success: true,
+        title: title,
+        thumbnail: thumbnail,
+        direct_url: videoUrlHD || videoUrlSD,
+        formats: formats
       };
 
       return new Response(JSON.stringify(response, null, 2), { headers });
+
     } catch (err) {
-      // Fallback: Agar upar wali microservice down ho toh direct backup standard extractor hit karein
-      try {
-        const altRes = await fetch(`https://api.vsaix.com/ytdlp?url=${encodeURIComponent(targetUrl)}`);
-        const altData = await altRes.json();
-        return new Response(JSON.stringify(altData, null, 2), { headers });
-      } catch(e) {
-        return new Response(JSON.stringify({ error: "yt-dlp extraction failed: " + err.message }), { headers, status: 500 });
-      }
+      return new Response(
+        JSON.stringify({ error: "Extraction failed: " + err.message, note: "Deno Deploy Native Engine" }), 
+        { headers, status: 500 }
+      );
     }
   }
 
   return new Response(JSON.stringify({ error: "404 Not Found" }), { headers, status: 404 });
 });
-
