@@ -1,6 +1,6 @@
-// Deno Deploy Compatible Multi-Site Video Extractor (Instagram, Facebook, YouTube, etc.)
+// Multi-Site Extractor using real yt-dlp binary (For Render / Railway)
 
-Deno.serve(async (req) => {
+Deno.serve({ port: 8080 }, async (req) => {
   const { pathname, searchParams } = new URL(req.url);
 
   const headers = {
@@ -9,59 +9,63 @@ Deno.serve(async (req) => {
     "Access-Control-Allow-Methods": "GET, OPTIONS",
   };
 
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers });
-  }
+  if (req.method === "OPTIONS") return new Response(null, { headers });
 
   if (pathname === "/") {
-    return new Response(
-      JSON.stringify({ status: "running", message: "Use /extract?url=..." }, null, 2),
-      { headers }
-    );
+    return new Response(JSON.stringify({ status: "running", hook: "/extract?url=..." }), { headers });
   }
 
   if (pathname === "/extract") {
     const targetUrl = searchParams.get("url");
     if (!targetUrl) {
-      return new Response(JSON.stringify({ error: "Missing ?url= parameter" }), { headers, status: 400 });
+      return new Response(JSON.stringify({ error: "Missing ?url=" }), { headers, status: 400 });
     }
 
     try {
-      // Hum open-source Cobalt API ka use kar rahe hain jo piche backend me yt-dlp hi chalata hai
-      const cobaltApi = "https://api.cobalt.tools/api/json";
-      
-      const response = await fetch(cobaltApi, {
-        method: "POST",
-        headers: {
-          "Accept": "application/json",
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          url: targetUrl,
-          videoQuality: "720", // Options: 144, 240, 360, 480, 720, 1080, max
-          audioFormat: "mp3",
-          downloadMode: "auto", // Automatically detects video or audio
-        }),
+      // System ke yt-dlp ko call kar rahe hain
+      const command = new Deno.Command("yt-dlp", {
+        args: [
+          "--dump-json",
+          "--no-playlist",
+          "--break-on-existing", 
+          targetUrl
+        ],
+        stdout: "piped",
+        stderr: "piped",
       });
 
-      if (!response.ok) {
-        const errData = await response.text();
-        throw new Error(`Extraction failed: ${errData}`);
+      const { success, stdout, stderr } = await command.output();
+
+      if (!success) {
+        const errorString = new TextDecoder().decode(stderr);
+        throw new Error(`yt-dlp error: ${errorString}`);
       }
 
-      const data = await response.json();
+      const rawJson = new TextDecoder().decode(stdout);
+      const ytData = JSON.parse(rawJson);
 
-      // Response wrapper ko aapke according clean structure me convert kar rahe hain
-      const finalResult = {
+      // Sabhi platforms (Insta, FB, YT) ke liye common response structure
+      const result = {
         success: true,
-        source_url: targetUrl,
-        status: data.status, // "stream", "redirect", "picker"
-        download_url: data.url || "N/A", // Direct downloadable video/audio link
-        picker_items: data.picker || [], // Agar multiple qualities/photos hain (like Insta Carousel)
-        text: data.text || ""
+        title: ytData.title || "No Title",
+        extractor: ytData.extractor, // e.g., "Instagram", "Facebook", "Youtube"
+        thumbnail: ytData.thumbnail || "",
+        duration: ytData.duration || 0,
+        // Best quality mixed video+audio URL (Aksar Insta/FB par direct single link mil jata hai)
+        direct_download_url: ytData.url || "", 
+        // Saare available formats (Video only, Audio only, Adaptive)
+        formats: ytData.formats?.map((f) => ({
+          format_id: f.format_id,
+          ext: f.ext,
+          resolution: f.resolution || `${f.width}x${f.height}`,
+          url: f.url,
+          vcodec: f.vcodec,
+          acodec: f.acodec,
+          filesize: f.filesize || f.filesize_approx || "Unknown"
+        })) || []
       };
 
-      return new Response(JSON.stringify(finalResult, null, 2), { headers });
+      return new Response(JSON.stringify(result, null, 2), { headers });
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
