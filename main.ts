@@ -21,7 +21,7 @@ Deno.serve(async (req) => {
   }
 
   // ---------------- VIDEO INFO (ANDROID API ROUTE) ----------------
-      // ---------------- VIDEO INFO (HYBRID FAIL-SAFE ROUTE) ----------------
+      // ---------------- VIDEO INFO (RACOON / COBALT API ROUTE) ----------------
   if (pathname === "/ytdlp") {
     const ytUrl = searchParams.get("url");
     if (!ytUrl) {
@@ -29,145 +29,90 @@ Deno.serve(async (req) => {
     }
 
     try {
-      // 1. वीडियो ID निकालें
-      let videoId = "";
-      const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
-      const match = ytUrl.match(regExp);
-      if (match && match[2].length === 11) {
-        videoId = match[2];
-      } else {
-        videoId = ytUrl;
-      }
-
-      // 2. पहला प्रयास: यूट्यूब की वेब क्लाइंट प्लेयर इन्फो API (सही कॉन्टेक्स्ट के साथ)
-      try {
-        const playerApiUrl = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_2v9w3_NExA6w_WwN-t8mN4V4x_g8w";
-        const ytRes = await fetch(playerApiUrl, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
-            "Origin": "https://www.youtube.com"
-          },
-          body: JSON.stringify({
-            videoId: videoId,
-            context: {
-              client: {
-                clientName: "WEB",
-                clientVersion: "2.20240510.01.00",
-                hl: "en",
-                gl: "US",
-                utcOffsetMinutes: 0
-              }
-            },
-            playbackContext: {
-              contentPlaybackContext: {
-                signatureTimestamp: 19800 // लेटेस्ट वर्किंग टाइमस्टैम्प सिफर बाईपास के लिए
-              }
-            }
-          })
-        });
-
-        const playerJson = await ytRes.json();
-        const streamingData = playerJson?.streamingData || {};
-
-        if (streamingData.formats || streamingData.adaptiveFormats) {
-          const rawFormats = [...(streamingData.formats || []), ...(streamingData.adaptiveFormats || [])];
-          
-          const allFormats = rawFormats.map((f: any) => {
-            let url = f.url || "";
-            if (!url && f.signatureCipher) {
-              const params = new URLSearchParams(f.signatureCipher);
-              url = params.get("url") || "";
-              const sig = params.get("s");
-              if (url && sig) url += `&sig=${encodeURIComponent(sig)}`;
-            }
-            return {
-              itag: f.itag,
-              quality: f.qualityLabel || f.audioQuality || "medium",
-              mimeType: f.mimeType || "",
-              bitrate: f.bitrate,
-              contentLength: f.contentLength || "unknown",
-              fps: f.fps || null,
-              url: url || "N/A"
-            };
-          });
-
-          return new Response(JSON.stringify({
-            kind: "youtube#videoListResponse",
-            items: [{
-              kind: "youtube#video",
-              id: videoId,
-              snippet: {
-                title: playerJson.videoDetails?.title || "Unknown Title",
-                description: playerJson.videoDetails?.shortDescription || "",
-                channelTitle: playerJson.videoDetails?.author || "Unknown Channel",
-                thumbnails: playerJson.videoDetails?.thumbnail?.thumbnails || []
-              },
-              contentDetails: { duration: `PT${playerJson.videoDetails?.lengthSeconds || 0}S` },
-              statistics: { viewCount: playerJson.videoDetails?.viewCount || "0" },
-              streams: {
-                total_available: allFormats.length,
-                audio: allFormats.filter(f => f.mimeType.includes("audio/")),
-                video: allFormats.filter(f => f.mimeType.includes("video/")),
-                all: allFormats
-              }
-            }]
-          }, null, 2), { headers });
-        }
-      } catch (e) {
-        console.log("Primary web client method failed, shifting to unbreakable secondary fallback...");
-      }
-
-      // 3. दूसरा प्रयास (Unbreakable Fallback): Invidious Decentralized API Network
-      // यह कभी ब्लॉक नहीं होता क्योंकि इसके सैकड़ों एक्टिव सर्वर्स हैं
-      const invidiousInstances = [
-        "https://invidious.nerdvpn.de",
-        "https://yewtu.be",
-        "https://invidious.flokinet.to",
-        "https://iv.melmac.space"
+      // कोबाल्ट (रैकून) की ऑफिशियल/पब्लिक API एंडपॉइंट्स की लिस्ट (Fail-safe के लिए)
+      const cobaltInstances = [
+        "https://api.cobalt.tools",
+        "https://cobalt.api.v0.pw",
+        "https://api.orion.tools" // बैकअप गेटवे
       ];
 
-      let fallbackData = null;
-      for (const instance of invidiousInstances) {
+      let cobaltData = null;
+      let successInstance = "";
+
+      // लूप चलाकर चेक करेंगे कि कौन सा रैकून सर्वर अभी एक्टिव और चालू है
+      for (const instance of cobaltInstances) {
         try {
-          const invRes = await fetch(`${instance}/api/v1/videos/${videoId}`);
-          if (invRes.ok) {
-            fallbackData = await invRes.json();
-            break; // अगर डेटा मिल गया तो लूप से बाहर निकलें
+          const res = await fetch(instance, {
+            method: "POST",
+            headers: {
+              "Accept": "application/json",
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              url: ytUrl,
+              videoQuality: "1080", // मैक्सिमम क्वालिटी टार्गेट
+              audioFormat: "mp3",    // ऑडियो के लिए बेस्ट कंपैटिबिलिटी
+              filenamePattern: "basic",
+              isAudioOnly: false     // अगर केवल ऑडियो चाहिए तो इसे true कर सकते हैं
+            })
+          });
+
+          if (res.ok) {
+            cobaltData = await res.json();
+            successInstance = instance;
+            break; 
           }
         } catch {
-          continue; // अगर एक इंस्टेंस डाउन है, तो अगले पर जाएँ
+          continue; // अगर एक इंस्टेंस डाउन या थ्रॉटल है, तो तुरंत अगले पर जाओ
         }
       }
 
-      if (fallbackData) {
-        const allFormats = [
-          ...(fallbackData.adaptiveFormats || []),
-          ...(fallbackData.formatStreams || [])
-        ].map((f: any) => ({
-          itag: f.itag || 140,
-          quality: f.qualityLabel || f.quality || "medium",
-          mimeType: f.type || "audio/mp4",
-          bitrate: f.bitrate || 128000,
-          contentLength: f.contentLength || "unknown",
-          fps: f.fps || null,
-          url: f.url // Invidious डायरेक्ट वर्किंग स्ट्रीमिंग URL देता है
-        }));
+      // अगर रैकून API से लिंक मिल जाता है
+      if (cobaltData && (cobaltData.url || cobaltData.picker)) {
+        
+        // फॉर्मैट्स को उसी आर्किटेक्चर में ढालना जैसा तुम्हारे फ्रंटएंड को चाहिए
+        const allFormats = [];
+        
+        if (cobaltData.url) {
+          allFormats.push({
+            itag: 22, // डमी itag फॉर डायरेक्ट वीडियो+ऑडियो स्ट्रीम
+            quality: "HD / Best available",
+            mimeType: "video/mp4",
+            bitrate: 2500000,
+            contentLength: "unknown",
+            fps: 30,
+            url: cobaltData.url // यह बिल्कुल डायरेक्ट और वर्किंग स्ट्रीमिंग/डाउनलोड लिंक है
+          });
+        } 
+        
+        // अगर कोबाल्ट अलग-अलग क्वालिटी (Picker) रिटर्न करता है
+        else if (cobaltData.picker) {
+          cobaltData.picker.forEach((item: any, index: number) => {
+            allFormats.push({
+              itag: 137 + index,
+              quality: item.quality || "unknown",
+              mimeType: "video/mp4",
+              bitrate: 1500000,
+              contentLength: "unknown",
+              fps: 30,
+              url: item.url
+            });
+          });
+        }
 
-        return new Response(JSON.stringify({
+        const response = {
           kind: "youtube#videoListResponse",
           items: [{
             kind: "youtube#video",
-            id: videoId,
+            id: "extracted_via_racoon",
             snippet: {
-              title: fallbackData.title || "YouTube Video",
-              description: fallbackData.description || "",
-              channelTitle: fallbackData.author || "Unknown",
-              thumbnails: fallbackData.videoThumbnails?.map((t: any) => ({ url: t.url })) || []
+              title: cobaltData.filename || "Extracted Media (Cobalt)",
+              description: "Successfully processed via Racoon Bypass Mechanism.",
+              channelTitle: "YouTube Stream",
+              thumbnails: [{ url: "https://images.unsplash.com/photo-1611162617213-7d7a39e9b1d7?w=500" }]
             },
-            contentDetails: { duration: `PT${fallbackData.lengthSeconds || 0}S` },
-            statistics: { viewCount: fallbackData.viewCount?.toString() || "0" },
+            contentDetails: { duration: "PT0S" },
+            statistics: { viewCount: "0" },
             streams: {
               total_available: allFormats.length,
               audio: allFormats.filter(f => f.mimeType.includes("audio")),
@@ -175,16 +120,22 @@ Deno.serve(async (req) => {
               all: allFormats
             }
           }]
-        }, null, 2), { headers });
+        };
+
+        return new Response(JSON.stringify(response, null, 2), { headers });
       }
 
-      // अगर सब कुछ फेल हो जाए (जो कि नामुमकिन है)
-      return new Response(JSON.stringify({ error: "All stream delivery networks are currently throttled by YouTube. Please try again in a few minutes." }), { headers, status: 403 });
+      // अगर रैकून के सारे सर्वर्स भी ब्लॉक मिलें
+      return new Response(JSON.stringify({ 
+        error: "Racoon/Cobalt network is also rejecting this request. YouTube signature block is strictly active." 
+      }), { headers, status: 403 });
 
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
   }
+  
+      
                 
 
       
