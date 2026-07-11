@@ -21,6 +21,7 @@ Deno.serve(async (req) => {
   }
 
   // ---------------- VIDEO INFO (ANDROID API ROUTE) ----------------
+    // ---------------- VIDEO INFO (WEB EMBEDDED PLAYER ROUTE) ----------------
   if (pathname === "/ytdlp") {
     const ytUrl = searchParams.get("url");
     if (!ytUrl) {
@@ -28,31 +29,31 @@ Deno.serve(async (req) => {
     }
 
     try {
-      // 1. वीडियो ID को URL से अलग करें
+      // 1. वीडियो ID निकालें
       let videoId = "";
       const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
       const match = ytUrl.match(regExp);
       if (match && match[2].length === 11) {
         videoId = match[2];
       } else {
-        videoId = ytUrl; // अगर केवल ID पास की गई हो
+        videoId = ytUrl;
       }
 
-      // 2. यूट्यूब के ऑफिशियल एंड्रॉइड इनरट्यूब API को रिक्वेस्ट भेजें
+      // 2. यूट्यूब के वेब एंबेडेड क्लाइंट को रिक्वेस्ट भेजें
       const apiUrl = "https://www.youtube.com/youtubei/v1/player?key=AIzaSyAO_2v9w3_NExA6w_WwN-t8mN4V4x_g8w";
       const apiResponse = await fetch(apiUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "User-Agent": "com.google.android.youtube/19.29.37 (Linux; U; Android 11; gv) AppleWebKit/537.36 Chrome/120.0.0.0 Mobile Safari/537.36"
+          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+          "Origin": "https://www.youtube.com"
         },
         body: JSON.stringify({
           videoId: videoId,
           context: {
             client: {
-              clientName: "ANDROID",
-              clientVersion: "19.29.37",
-              androidSdkVersion: 30,
+              clientName: "WEB_EMBEDDED_PLAYER",
+              clientVersion: "1.20240101.01.00",
               hl: "en",
               gl: "US"
             }
@@ -63,8 +64,12 @@ Deno.serve(async (req) => {
       const playerJson = await apiResponse.json();
       const streamingData = playerJson?.streamingData || {};
 
+      // अगर फिर भी ब्लॉक हो, तो पुराना फॉलबैक चेक
       if (!streamingData.formats && !streamingData.adaptiveFormats) {
-        return new Response(JSON.stringify({ error: "Unable to extract streams. Video might be age-restricted or private." }), { headers, status: 403 });
+        return new Response(JSON.stringify({ 
+          error: "Streams hidden by YouTube. Try another video or refresh.", 
+          debug: playerJson?.playabilityStatus?.status || "Unknown Status"
+        }), { headers, status: 403 });
       }
 
       const rawFormats = [
@@ -72,11 +77,11 @@ Deno.serve(async (req) => {
         ...(streamingData.adaptiveFormats || [])
       ];
 
-      // 3. फॉर्मेट पार्सर (एंड्रॉइड क्लाइंट सीधे 'url' देता है, बिना किसी सिफर के झंझट के)
+      // 3. फॉर्मेट पार्सर
       const allFormats = rawFormats.map((f: any) => {
         let url = f.url || "";
         
-        // अगर बहुत ही रेयर केस में सिफर आए तो उसे भी हैंडल कर लेते हैं
+        // अगर सिफर (Cipher) मौजूद है, तो उसे डिकोड करें
         if (!url && (f.signatureCipher || f.cipher)) {
           const cipherText = f.signatureCipher || f.cipher;
           const params = new URLSearchParams(cipherText);
@@ -131,7 +136,7 @@ Deno.serve(async (req) => {
               video: videoStreams,
               all: allFormats
             },
-            comments: [] // एंड्रॉइड प्लेयर API कमेंट्स रिटर्न नहीं करती है
+            comments: []
           },
         ],
       };
@@ -141,6 +146,8 @@ Deno.serve(async (req) => {
       return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
   }
+
+  
 
   // ---------------- SEARCH ----------------
   if (pathname === "/search") {
