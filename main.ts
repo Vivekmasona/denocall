@@ -1,4 +1,4 @@
-// Deno YouTube Extractor + Search (v3 style) with Android Client API
+// Deno YouTube Extractor + Search (v3 style) with CORS
 
 Deno.serve(async (req) => {
   const { pathname, searchParams } = new URL(req.url);
@@ -20,8 +20,7 @@ Deno.serve(async (req) => {
     );
   }
 
-  // ---------------- VIDEO INFO (ANDROID API ROUTE) ----------------
-        // ---------------- VIDEO INFO (CLIENT-SIDE BYPASS ROUTE) ----------------
+  // ---------------- VIDEO INFO ----------------
   if (pathname === "/ytdlp") {
     const ytUrl = searchParams.get("url");
     if (!ytUrl) {
@@ -29,74 +28,96 @@ Deno.serve(async (req) => {
     }
 
     try {
-      // 1. वीडियो ID निकालें
-      let videoId = "";
-      const regExp = /^.*(youtu.be\/|v\/|u\/\w\/|embed\/|watch\?v=|\&v=)([^#\&\?]*).*/;
-      const match = ytUrl.match(regExp);
-      if (match && match[2].length === 11) {
-        videoId = match[2];
-      } else {
-        videoId = ytUrl;
+      const res = await fetch(ytUrl);
+      const html = await res.text();
+
+      // Video title
+      const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].replace(" - YouTube", "") : "Unknown";
+
+      // Player response
+      const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
+      const playerJson = playerMatch ? JSON.parse(playerMatch[1]) : null;
+
+      const formats = playerJson?.streamingData?.formats || [];
+      const adaptive = playerJson?.streamingData?.adaptiveFormats || [];
+      const audio =
+        adaptive.find((f: any) => f.mimeType.includes("audio")) ||
+        formats.find((f: any) => f.mimeType.includes("audio"));
+
+      const videoDetails = playerJson?.videoDetails || {};
+      const microformat = playerJson?.microformat?.playerMicroformatRenderer || {};
+
+      const channelName = videoDetails.author || "Unknown";
+      const channelId = videoDetails.channelId || "";
+
+      const thumbnails = videoDetails.thumbnail?.thumbnails || [];
+      const publishDate = microformat.publishDate || "";
+      const viewCount = videoDetails.viewCount || "0";
+      const durationSeconds = parseInt(videoDetails.lengthSeconds || "0", 10);
+
+      // Extract initial comments
+      const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
+      let comments: Array<{ author: string; text: string; likes: number }> = [];
+
+      if (dataMatch) {
+        const initialData = JSON.parse(dataMatch[1]);
+        const contents =
+          initialData?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
+
+        for (const c of contents) {
+          const itemSection = c.itemSectionRenderer?.contents || [];
+          for (const item of itemSection) {
+            const commentThread = item.commentThreadRenderer?.comment?.commentRenderer;
+            if (commentThread) {
+              const author = commentThread.authorText?.simpleText || "Unknown";
+              const text =
+                commentThread.contentText?.runs?.map((r: any) => r.text).join("") || "";
+              const likes = commentThread.voteCount?.simpleText
+                ? parseInt(commentThread.voteCount.simpleText.replace(/[^0-9]/g, ""), 10)
+                : 0;
+              comments.push({ author, text, likes });
+            }
+          }
+        }
       }
 
-      // 2. यूट्यूब का 100% वर्किंग वेब-प्लेयर स्ट्रीमिंग सोर्स (क्रॉस-ओरिजिन कंपैटिबल)
-      // इस लिंक को जब फ्रंटएंड सीधे <video> या <a> टैग में डालेगा, तो ब्राउज़र के खुद के कुकीज़/टोकन की वजह से यह बिना ब्लॉक हुए चलेगा
-      const directStreamUrl = `https://www.youtube.com/embed/${videoId}?autoplay=1&modestbranding=1&rel=0`;
-
-      // 3. फ्रंटएंड के लिए यूट्यूब का कस्टमाइज्ड रिपॉन्स तैयार करें
+      // v3-style video response
       const response = {
         kind: "youtube#videoListResponse",
-        status: "bypass_active",
-        message: "Server scraping is dead. Client-side browser execution injected successfully.",
-        items: [{
-          kind: "youtube#video",
-          id: videoId,
-          snippet: {
-            title: "Bypassed YouTube Stream",
-            description: "Direct client injection active. This link bypasses YouTube's server signature block by rendering through the user's authentic browser session.",
-            channelTitle: "YouTube Playback",
-            thumbnails: [{ url: `https://img.youtube.com/vi/${videoId}/maxresdefault.jpg` }]
+        items: [
+          {
+            kind: "youtube#video",
+            id: videoDetails.videoId,
+            snippet: {
+              publishedAt: publishDate,
+              channelId,
+              channelTitle: channelName,
+              title,
+              description: videoDetails.shortDescription || "",
+              thumbnails: {
+                default: thumbnails[0] || {},
+                medium: thumbnails[Math.floor(thumbnails.length / 2)] || {},
+                high: thumbnails[thumbnails.length - 1] || {},
+              },
+            },
+            contentDetails: {
+              duration: `PT${durationSeconds}S`,
+            },
+            statistics: {
+              viewCount,
+            },
+            audioUrl: audio?.url || "N/A",
+            comments: comments.slice(0, 10),
           },
-          contentDetails: { duration: "PT0S" },
-          statistics: { viewCount: "Live" },
-          streams: {
-            total_available: 2,
-            // यह लिंक्स फ्रंटएंड पर कभी 'Throttled' या 'Blocked' नहीं होंगे
-            audio: [
-              {
-                itag: 140,
-                quality: "AUDIO_QUALITY_MEDIUM",
-                mimeType: "audio/mp4",
-                url: `https://www.youtube.com/watch?v=${videoId}` // फ्रंटएंड इस पर डायरेक्ट 'fetch' मार सकता है या इनलाइन प्लेयर में चला सकता है
-              }
-            ],
-            video: [
-              {
-                itag: 22,
-                quality: "720p (Auto-Bypass)",
-                mimeType: "video/mp4",
-                url: directStreamUrl // इसे सीधे iframe या वीडियो प्लेयर के src में डालो
-              }
-            ],
-            all: [
-              { itag: 22, url: directStreamUrl }
-            ]
-          }
-        }]
+        ],
       };
 
       return new Response(JSON.stringify(response, null, 2), { headers });
-
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
   }
-
-      
-                
-
-      
-        
 
   // ---------------- SEARCH ----------------
   if (pathname === "/search") {
@@ -107,7 +128,7 @@ Deno.serve(async (req) => {
 
     try {
       const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-      const res = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } });
+      const res = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
       const html = await res.text();
 
       const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
@@ -162,3 +183,4 @@ Deno.serve(async (req) => {
 
   return new Response(JSON.stringify({ error: "404 Not Found" }), { headers, status: 404 });
 });
+
