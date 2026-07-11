@@ -1,4 +1,4 @@
-// Deno Deploy Multi-Extractor: Direct Facebook & Instagram Parser with CORS
+// Deno YouTube Extractor + Search (v3 style) with CORS
 
 Deno.serve(async (req) => {
   const { pathname, searchParams } = new URL(req.url);
@@ -15,102 +15,169 @@ Deno.serve(async (req) => {
 
   if (pathname === "/") {
     return new Response(
-      JSON.stringify({ status: "running", message: "Use /extract?url=..." }, null, 2),
+      JSON.stringify({ status: "running", message: "Use /ytdlp?url=... or /search?q=..." }, null, 2),
       { headers }
     );
   }
 
-  if (pathname === "/extract") {
-    const targetUrl = searchParams.get("url");
-    if (!targetUrl) {
-      return new Response(JSON.stringify({ error: "Missing ?url= parameter" }), { headers, status: 400 });
+  // ---------------- VIDEO INFO ----------------
+  if (pathname === "/ytdlp") {
+    const ytUrl = searchParams.get("url");
+    if (!ytUrl) {
+      return new Response(JSON.stringify({ error: "Missing ?url=" }), { headers, status: 400 });
     }
 
     try {
-      // Kisi bhi bot blocker ko bypass karne ke liye generic User-Agent
-      const fetchHeaders = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-      };
-
-      const res = await fetch(targetUrl, { headers: fetchHeaders });
+      const res = await fetch(ytUrl);
       const html = await res.text();
 
-      let videoUrlHD = "";
-      let videoUrlSD = "";
-      let title = "Social Media Video";
-      let thumbnail = "";
+      // Video title
+      const titleMatch = html.match(/<title>(.*?)<\/title>/i);
+      const title = titleMatch ? titleMatch[1].replace(" - YouTube", "") : "Unknown";
 
-      // ---------------- FACEBOOK PARSING ENGINE ----------------
-      if (targetUrl.includes("facebook.com") || targetUrl.includes("fb.watch") || targetUrl.includes("share/r")) {
-        // Facebook ke graph/source se HD aur SD video links extract karna
-        const hdMatch = html.match(/"browser_native_hd_url":"([^"]+)"/) || html.match(/hd_src:"([^"]+)"/);
-        const sdMatch = html.match(/"browser_native_sd_url":"([^"]+)"/) || html.match(/sd_src:"([^"]+)"/);
-        const titleMatch = html.match(/<title>(.*?)<\/title>/);
-        const thumbMatch = html.match(/"preferred_thumbnail":{"image":{"uri":"([^"]+)"/);
+      // Player response
+      const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
+      const playerJson = playerMatch ? JSON.parse(playerMatch[1]) : null;
 
-        if (hdMatch) videoUrlHD = JSON.parse(`"${hdMatch[1]}"`); // Clean unicode escapes
-        if (sdMatch) videoUrlSD = JSON.parse(`"${sdMatch[1]}"`);
-        if (titleMatch) title = titleMatch[1];
-        if (thumbMatch) thumbnail = JSON.parse(`"${thumbMatch[1]}"`);
-      } 
-      
-      // ---------------- INSTAGRAM PARSING ENGINE ----------------
-      else if (targetUrl.includes("instagram.com")) {
-        // Instagram og:video tags ya meta data formats check karta hai
-        const instaMatch = html.match(/<meta property="og:video" content="([^"]+)"/) || html.match(/"video_url":"([^"]+)"/);
-        const titleMatch = html.match(/<meta property="og:title" content="([^"]+)"/);
-        const thumbMatch = html.match(/<meta property="og:image" content="([^"]+)"/);
+      const formats = playerJson?.streamingData?.formats || [];
+      const adaptive = playerJson?.streamingData?.adaptiveFormats || [];
+      const audio =
+        adaptive.find((f: any) => f.mimeType.includes("audio")) ||
+        formats.find((f: any) => f.mimeType.includes("audio"));
 
-        if (instaMatch) videoUrlHD = instaMatch[1].replace(/&amp;/g, "&");
-        if (titleMatch) title = titleMatch[1];
-        if (thumbMatch) thumbnail = thumbMatch[1].replace(/&amp;/g, "&");
+      const videoDetails = playerJson?.videoDetails || {};
+      const microformat = playerJson?.microformat?.playerMicroformatRenderer || {};
+
+      const channelName = videoDetails.author || "Unknown";
+      const channelId = videoDetails.channelId || "";
+
+      const thumbnails = videoDetails.thumbnail?.thumbnails || [];
+      const publishDate = microformat.publishDate || "";
+      const viewCount = videoDetails.viewCount || "0";
+      const durationSeconds = parseInt(videoDetails.lengthSeconds || "0", 10);
+
+      // Extract initial comments
+      const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
+      let comments: Array<{ author: string; text: string; likes: number }> = [];
+
+      if (dataMatch) {
+        const initialData = JSON.parse(dataMatch[1]);
+        const contents =
+          initialData?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
+
+        for (const c of contents) {
+          const itemSection = c.itemSectionRenderer?.contents || [];
+          for (const item of itemSection) {
+            const commentThread = item.commentThreadRenderer?.comment?.commentRenderer;
+            if (commentThread) {
+              const author = commentThread.authorText?.simpleText || "Unknown";
+              const text =
+                commentThread.contentText?.runs?.map((r: any) => r.text).join("") || "";
+              const likes = commentThread.voteCount?.simpleText
+                ? parseInt(commentThread.voteCount.simpleText.replace(/[^0-9]/g, ""), 10)
+                : 0;
+              comments.push({ author, text, likes });
+            }
+          }
+        }
       }
 
-      // Agar koi direct link nahi mila toh check generic video tags
-      if (!videoUrlHD && !videoUrlSD) {
-        const genericMatch = html.match(/<meta property="og:video:url" content="([^"]+)"/);
-        if (genericMatch) videoUrlHD = genericMatch[1];
-      }
-
-      // Final response build jo aapke format list se match karega
-      const formats = [];
-      if (videoUrlHD) {
-        formats.push({
-          format_id: "HD / Best",
-          url: videoUrlHD,
-          ext: "mp4",
-          resolution: "High Quality"
-        });
-      }
-      if (videoUrlSD) {
-        formats.push({
-          format_id: "SD / Standard",
-          url: videoUrlSD,
-          ext: "mp4",
-          resolution: "Standard Quality"
-        });
-      }
-
-      if (formats.length === 0) {
-        throw new Error("Could not find any downloadable video stream in page source.");
-      }
-
+      // v3-style video response
       const response = {
-        success: true,
-        title: title,
-        thumbnail: thumbnail,
-        direct_url: videoUrlHD || videoUrlSD,
-        formats: formats
+        kind: "youtube#videoListResponse",
+        items: [
+          {
+            kind: "youtube#video",
+            id: videoDetails.videoId,
+            snippet: {
+              publishedAt: publishDate,
+              channelId,
+              channelTitle: channelName,
+              title,
+              description: videoDetails.shortDescription || "",
+              thumbnails: {
+                default: thumbnails[0] || {},
+                medium: thumbnails[Math.floor(thumbnails.length / 2)] || {},
+                high: thumbnails[thumbnails.length - 1] || {},
+              },
+            },
+            contentDetails: {
+              duration: `PT${durationSeconds}S`,
+            },
+            statistics: {
+              viewCount,
+            },
+            audioUrl: audio?.url || "N/A",
+            comments: comments.slice(0, 10),
+          },
+        ],
       };
 
       return new Response(JSON.stringify(response, null, 2), { headers });
-
     } catch (err) {
-      return new Response(
-        JSON.stringify({ error: "Extraction failed: " + err.message, note: "Deno Deploy Native Engine" }), 
-        { headers, status: 500 }
-      );
+      return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
+    }
+  }
+
+  // ---------------- SEARCH ----------------
+  if (pathname === "/search") {
+    const query = searchParams.get("q");
+    if (!query) {
+      return new Response(JSON.stringify({ error: "Missing ?q=" }), { headers, status: 400 });
+    }
+
+    try {
+      const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+      const res = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
+      const html = await res.text();
+
+      const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
+      if (!dataMatch) {
+        return new Response(JSON.stringify({ error: "Could not parse search results" }), { headers });
+      }
+
+      const initialData = JSON.parse(dataMatch[1]);
+      const contents =
+        initialData.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents
+          ?.flatMap((c: any) => c.itemSectionRenderer?.contents || []) || [];
+
+      const items: any[] = [];
+
+      for (const item of contents) {
+        const video = item.videoRenderer;
+        if (video) {
+          const videoId = video.videoId;
+          const title = video.title?.runs?.map((r: any) => r.text).join("") || "Unknown";
+          const channelTitle = video.ownerText?.runs?.map((r: any) => r.text).join("") || "Unknown";
+          const thumbnails = video.thumbnail?.thumbnails || [];
+          const description = video.descriptionSnippet?.runs?.map((r: any) => r.text).join("") || "";
+
+          items.push({
+            kind: "youtube#searchResult",
+            id: { kind: "youtube#video", videoId },
+            snippet: {
+              title,
+              description,
+              channelTitle,
+              thumbnails: {
+                default: thumbnails[0] || {},
+                medium: thumbnails[Math.floor(thumbnails.length / 2)] || {},
+                high: thumbnails[thumbnails.length - 1] || {},
+              },
+            },
+          });
+        }
+      }
+
+      const response = {
+        kind: "youtube#searchListResponse",
+        pageInfo: { totalResults: items.length, resultsPerPage: 20 },
+        items: items.slice(0, 20),
+      };
+
+      return new Response(JSON.stringify(response, null, 2), { headers });
+    } catch (err) {
+      return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
   }
 
