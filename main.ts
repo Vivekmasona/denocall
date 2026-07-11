@@ -21,6 +21,7 @@ Deno.serve(async (req) => {
   }
 
   // ---------------- VIDEO INFO ----------------
+    // ---------------- VIDEO INFO (UPDATED) ----------------
   if (pathname === "/ytdlp") {
     const ytUrl = searchParams.get("url");
     if (!ytUrl) {
@@ -28,7 +29,7 @@ Deno.serve(async (req) => {
     }
 
     try {
-      const res = await fetch(ytUrl);
+      const res = await fetch(ytUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } });
       const html = await res.text();
 
       // Video title
@@ -37,52 +38,93 @@ Deno.serve(async (req) => {
 
       // Player response
       const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-      const playerJson = playerMatch ? JSON.parse(playerMatch[1]) : null;
+      if (!playerMatch) {
+        return new Response(JSON.stringify({ error: "Could not find player response. Video might be private or restricted." }), { headers, status: 404 });
+      }
+      
+      const playerJson = JSON.parse(playerMatch[1]);
+      const streamingData = playerJson?.streamingData || {};
+      
+      // यूट्यूब के दोनों तरह के फॉर्मेट्स (कंबाइंड और एडेप्टिव) को एक साथ लाएं
+      const rawFormats = [
+        ...(streamingData.formats || []),
+        ...(streamingData.adaptiveFormats || [])
+      ];
 
-      const formats = playerJson?.streamingData?.formats || [];
-      const adaptive = playerJson?.streamingData?.adaptiveFormats || [];
-      const audio =
-        adaptive.find((f: any) => f.mimeType.includes("audio")) ||
-        formats.find((f: any) => f.mimeType.includes("audio"));
+      // URL को डिकोड करने वाला हेल्पर फंक्शन (Cipher Decoder)
+      const parseFormat = (f: any) => {
+        let url = f.url || "";
+        
+        // अगर डायरेक्ट URL नहीं है तो signatureCipher से निकालें
+        if (!url && (f.signatureCipher || f.cipher)) {
+          const cipherText = f.signatureCipher || f.cipher;
+          const params = new URLSearchParams(cipherText);
+          const baseUrl = params.get("url");
+          const sp = params.get("sp") || "sig";
+          const sig = params.get("s");
+          
+          if (baseUrl) {
+            url = sig ? `${baseUrl}&${sp}=${sig}` : baseUrl;
+          }
+        }
+
+        return {
+          itag: f.itag,
+          quality: f.qualityLabel || f.audioQuality || "unknown",
+          mimeType: f.mimeType || "",
+          bitrate: f.bitrate,
+          contentLength: f.contentLength || "unknown",
+          fps: f.fps || null,
+          url: url || "N/A"
+        };
+      };
+
+      // सभी फॉर्मेट्स को डिकोड करके प्रोसेस करें
+      const allFormats = rawFormats.map(parseFormat);
+
+      // फ़िल्टर करके अलग-अलग कैटेगरीज बनाएं ताकि इस्तेमाल करने में आसानी हो
+      const audioStreams = allFormats.filter(f => f.mimeType.includes("audio/"));
+      const videoStreams = allFormats.filter(f => f.mimeType.includes("video/"));
 
       const videoDetails = playerJson?.videoDetails || {};
       const microformat = playerJson?.microformat?.playerMicroformatRenderer || {};
 
       const channelName = videoDetails.author || "Unknown";
       const channelId = videoDetails.channelId || "";
-
       const thumbnails = videoDetails.thumbnail?.thumbnails || [];
       const publishDate = microformat.publishDate || "";
       const viewCount = videoDetails.viewCount || "0";
       const durationSeconds = parseInt(videoDetails.lengthSeconds || "0", 10);
 
-      // Extract initial comments
+      // कमेंट्स निकालने का लॉजिक
       const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
       let comments: Array<{ author: string; text: string; likes: number }> = [];
 
       if (dataMatch) {
-        const initialData = JSON.parse(dataMatch[1]);
-        const contents =
-          initialData?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
+        try {
+          const initialData = JSON.parse(dataMatch[1]);
+          const contents = initialData?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
 
-        for (const c of contents) {
-          const itemSection = c.itemSectionRenderer?.contents || [];
-          for (const item of itemSection) {
-            const commentThread = item.commentThreadRenderer?.comment?.commentRenderer;
-            if (commentThread) {
-              const author = commentThread.authorText?.simpleText || "Unknown";
-              const text =
-                commentThread.contentText?.runs?.map((r: any) => r.text).join("") || "";
-              const likes = commentThread.voteCount?.simpleText
-                ? parseInt(commentThread.voteCount.simpleText.replace(/[^0-9]/g, ""), 10)
-                : 0;
-              comments.push({ author, text, likes });
+          for (const c of contents) {
+            const itemSection = c.itemSectionRenderer?.contents || [];
+            for (const item of itemSection) {
+              const commentThread = item.commentThreadRenderer?.comment?.commentRenderer;
+              if (commentThread) {
+                const author = commentThread.authorText?.simpleText || "Unknown";
+                const text = commentThread.contentText?.runs?.map((r: any) => r.text).join("") || "";
+                const likes = commentThread.voteCount?.simpleText
+                  ? parseInt(commentThread.voteCount.simpleText.replace(/[^0-9]/g, ""), 10)
+                  : 0;
+                comments.push({ author, text, likes });
+              }
             }
           }
+        } catch (_) {
+          // कमेंट्स पार्स न होने पर एरर न आए, खाली एरे चला जाए
         }
       }
 
-      // v3-style video response
+      // v3-style रिस्पॉन्स जिसमें अब सारा डेटा मौजूद है
       const response = {
         kind: "youtube#videoListResponse",
         items: [
@@ -107,7 +149,13 @@ Deno.serve(async (req) => {
             statistics: {
               viewCount,
             },
-            audioUrl: audio?.url || "N/A",
+            // अब यहाँ आपको सारे फॉर्मेट्स कैटेगराइज्ड मिलेंगे
+            streams: {
+              total_available: allFormats.length,
+              audio: audioStreams,
+              video: videoStreams,
+              all: allFormats // इसमें कंबाइंड (audio+video) भी शामिल हैं
+            },
             comments: comments.slice(0, 10),
           },
         ],
@@ -119,6 +167,7 @@ Deno.serve(async (req) => {
     }
   }
 
+      
   // ---------------- SEARCH ----------------
   if (pathname === "/search") {
     const query = searchParams.get("q");
