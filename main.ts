@@ -1,186 +1,182 @@
-// Deno YouTube Extractor + Search (v3 style) with CORS
+// Deno natively supports npm packages via 'npm:' prefix
+import express from "npm:express";
+import chromium from "npm:@sparticuz/chromium";
+import puppeteer from "npm:puppeteer-core";
 
-Deno.serve(async (req) => {
-  const { pathname, searchParams } = new URL(req.url);
+const app = express();
+const PORT = Deno.env.get("PORT") || 3000; // Deno-style environment variable
 
-  const headers = {
-    "content-type": "application/json",
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, OPTIONS",
-  };
-
-  if (req.method === "OPTIONS") {
-    return new Response(null, { headers });
+let browserPromise;
+async function getBrowser() {
+  if (!browserPromise) {
+    browserPromise = puppeteer.launch({
+      args: [
+        ...chromium.args,
+        "--no-sandbox",
+        "--disable-setuid-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-accelerated-2d-canvas",
+        "--no-first-run",
+        "--no-zygote",
+        "--single-process",
+        "--disable-gpu",
+      ],
+      defaultViewport: chromium.defaultViewport,
+      executablePath: await chromium.executablePath(),
+      headless: chromium.headless,
+      userDataDir: "/tmp/chrome-user-data",
+    });
   }
+  return browserPromise;
+}
 
-  if (pathname === "/") {
-    return new Response(
-      JSON.stringify({ status: "running", message: "Use /ytdlp?url=... or /search?q=..." }, null, 2),
-      { headers }
-    );
-  }
+const MEDIA_EXT_RE = /\.(mp4|webm|m3u8|mkv|mp3|aac|ogg|opus|wav|flac|m4a|jpg|jpeg|png|gif|bmp|webp)(\?|$)/i;
+const PRIORITY_DOMAINS = [
+  "youtube.com", "youtu.be",
+  "scontent", "cdninstagram",
+  "fbcdn.net", "facebook.com",
+  "twitter.com", "twimg.com",
+  "soundcloud.com",
+  "vimeo.com",
+  "googlevideo.com",
+  "play.google.com",
+];
 
-  // ---------------- VIDEO INFO ----------------
-  if (pathname === "/ytdlp") {
-    const ytUrl = searchParams.get("url");
-    if (!ytUrl) {
-      return new Response(JSON.stringify({ error: "Missing ?url=" }), { headers, status: 400 });
-    }
+app.get("/extract", async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ error: "Valid URL required" });
 
-    try {
-      const res = await fetch(ytUrl);
-      const html = await res.text();
+  try {
+    const browser = await getBrowser();
+    const page = await browser.newPage();
 
-      // Video title
-      const titleMatch = html.match(/<title>(.*?)<\/title>/i);
-      const title = titleMatch ? titleMatch[1].replace(" - YouTube", "") : "Unknown";
-
-      // Player response
-      const playerMatch = html.match(/ytInitialPlayerResponse\s*=\s*(\{.+?\});/s);
-      const playerJson = playerMatch ? JSON.parse(playerMatch[1]) : null;
-
-      const formats = playerJson?.streamingData?.formats || [];
-      const adaptive = playerJson?.streamingData?.adaptiveFormats || [];
-      const audio =
-        adaptive.find((f: any) => f.mimeType.includes("audio")) ||
-        formats.find((f: any) => f.mimeType.includes("audio"));
-
-      const videoDetails = playerJson?.videoDetails || {};
-      const microformat = playerJson?.microformat?.playerMicroformatRenderer || {};
-
-      const channelName = videoDetails.author || "Unknown";
-      const channelId = videoDetails.channelId || "";
-
-      const thumbnails = videoDetails.thumbnail?.thumbnails || [];
-      const publishDate = microformat.publishDate || "";
-      const viewCount = videoDetails.viewCount || "0";
-      const durationSeconds = parseInt(videoDetails.lengthSeconds || "0", 10);
-
-      // Extract initial comments
-      const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
-      let comments: Array<{ author: string; text: string; likes: number }> = [];
-
-      if (dataMatch) {
-        const initialData = JSON.parse(dataMatch[1]);
-        const contents =
-          initialData?.contents?.twoColumnWatchNextResults?.results?.results?.contents || [];
-
-        for (const c of contents) {
-          const itemSection = c.itemSectionRenderer?.contents || [];
-          for (const item of itemSection) {
-            const commentThread = item.commentThreadRenderer?.comment?.commentRenderer;
-            if (commentThread) {
-              const author = commentThread.authorText?.simpleText || "Unknown";
-              const text =
-                commentThread.contentText?.runs?.map((r: any) => r.text).join("") || "";
-              const likes = commentThread.voteCount?.simpleText
-                ? parseInt(commentThread.voteCount.simpleText.replace(/[^0-9]/g, ""), 10)
-                : 0;
-              comments.push({ author, text, likes });
+    // Inject script to capture dynamic media URLs
+    await page.evaluateOnNewDocument(() => {
+      const send = (obj) => console.log("CAPTURE_MEDIA::" + JSON.stringify(obj));
+      
+      // Patch fetch
+      const origFetch = window.fetch.bind(window);
+      window.fetch = (...args) => {
+        const p = origFetch(...args);
+        p.then(async (resp) => {
+          try {
+            const ct = resp.headers.get("content-type") || "";
+            const u = resp.url || args[0];
+            if (ct.includes("video") || ct.includes("audio") || ct.includes("image") || u.match(/\.(mp4|mp3|m3u8|jpg|jpeg|png|gif)/i)) {
+              send({ url: u, type: ct.split("/")[0] || "other", note: "fetch" });
             }
-          }
-        }
-      }
-
-      // v3-style video response
-      const response = {
-        kind: "youtube#videoListResponse",
-        items: [
-          {
-            kind: "youtube#video",
-            id: videoDetails.videoId,
-            snippet: {
-              publishedAt: publishDate,
-              channelId,
-              channelTitle: channelName,
-              title,
-              description: videoDetails.shortDescription || "",
-              thumbnails: {
-                default: thumbnails[0] || {},
-                medium: thumbnails[Math.floor(thumbnails.length / 2)] || {},
-                high: thumbnails[thumbnails.length - 1] || {},
-              },
-            },
-            contentDetails: {
-              duration: `PT${durationSeconds}S`,
-            },
-            statistics: {
-              viewCount,
-            },
-            audioUrl: audio?.url || "N/A",
-            comments: comments.slice(0, 10),
-          },
-        ],
+          } catch (e) {}
+        }).catch(()=>{});
+        return p;
       };
 
-      return new Response(JSON.stringify(response, null, 2), { headers });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
-    }
-  }
-
-  // ---------------- SEARCH ----------------
-  if (pathname === "/search") {
-    const query = searchParams.get("q");
-    if (!query) {
-      return new Response(JSON.stringify({ error: "Missing ?q=" }), { headers, status: 400 });
-    }
-
-    try {
-      const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-      const res = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0" } });
-      const html = await res.text();
-
-      const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
-      if (!dataMatch) {
-        return new Response(JSON.stringify({ error: "Could not parse search results" }), { headers });
-      }
-
-      const initialData = JSON.parse(dataMatch[1]);
-      const contents =
-        initialData.contents?.twoColumnSearchResultsRenderer?.primaryContents?.sectionListRenderer?.contents
-          ?.flatMap((c: any) => c.itemSectionRenderer?.contents || []) || [];
-
-      const items: any[] = [];
-
-      for (const item of contents) {
-        const video = item.videoRenderer;
-        if (video) {
-          const videoId = video.videoId;
-          const title = video.title?.runs?.map((r: any) => r.text).join("") || "Unknown";
-          const channelTitle = video.ownerText?.runs?.map((r: any) => r.text).join("") || "Unknown";
-          const thumbnails = video.thumbnail?.thumbnails || [];
-          const description = video.descriptionSnippet?.runs?.map((r: any) => r.text).join("") || "";
-
-          items.push({
-            kind: "youtube#searchResult",
-            id: { kind: "youtube#video", videoId },
-            snippet: {
-              title,
-              description,
-              channelTitle,
-              thumbnails: {
-                default: thumbnails[0] || {},
-                medium: thumbnails[Math.floor(thumbnails.length / 2)] || {},
-                high: thumbnails[thumbnails.length - 1] || {},
-              },
-            },
-          });
-        }
-      }
-
-      const response = {
-        kind: "youtube#searchListResponse",
-        pageInfo: { totalResults: items.length, resultsPerPage: 20 },
-        items: items.slice(0, 20),
+      // Patch XMLHttpRequest
+      const origOpen = window.XMLHttpRequest.prototype.open;
+      window.XMLHttpRequest.prototype.open = function(method, url) {
+        this._captureUrl = url;
+        return origOpen.apply(this, arguments);
+      };
+      const origSend = window.XMLHttpRequest.prototype.send;
+      window.XMLHttpRequest.prototype.send = function() {
+        this.addEventListener("load", function() {
+          try {
+            const ct = this.getResponseHeader("content-type") || "";
+            const u = this._captureUrl;
+            if (ct.includes("video") || ct.includes("audio") || ct.includes("image") || u.match(/\.(mp4|mp3|m3u8|jpg|jpeg|png|gif)/i)) {
+              send({ url: u, type: ct.split("/")[0] || "other", note: "xhr" });
+            }
+          } catch(e){}
+        });
+        return origSend.apply(this, arguments);
       };
 
-      return new Response(JSON.stringify(response, null, 2), { headers });
-    } catch (err) {
-      return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
-    }
-  }
+      // Observe <video>, <audio>, <img>
+      const collectDOM = () => {
+        const out = [];
+        document.querySelectorAll("video, audio").forEach(el => {
+          if (el.src) out.push({ url: el.src, type: el.tagName.toLowerCase(), note: "dom" });
+          if (el.currentSrc) out.push({ url: el.currentSrc, type: el.tagName.toLowerCase(), note: "dom" });
+          el.querySelectorAll("source").forEach(s => s.src && out.push({ url: s.src, type: el.tagName.toLowerCase(), note: "dom-source" }));
+        });
+        document.querySelectorAll("img").forEach(img => img.src && out.push({ url: img.src, type: "image", note: "dom-img" }));
+        return out;
+      };
 
-  return new Response(JSON.stringify({ error: "404 Not Found" }), { headers, status: 404 });
+      const initial = collectDOM();
+      initial.forEach(obj => send(obj));
+
+      const mo = new MutationObserver(() => collectDOM().forEach(obj => send(obj)));
+      mo.observe(document, { childList: true, subtree: true });
+    });
+
+    const results = [];
+    const seen = new Set();
+    function pushResult(obj) {
+      if (!obj?.url) return;
+      const key = obj.url + "|" + (obj.type || "");
+      if (seen.has(key)) return;
+      seen.add(key);
+
+      let type = obj.type || "other";
+      if (/video/i.test(type) || obj.url.match(/\.(mp4|webm|m3u8|mkv)/i)) type = "video";
+      else if (/audio/i.test(type) || obj.url.match(/\.(mp3|aac|ogg|wav|m4a|flac)/i)) type = "audio";
+      else if (/image/i.test(type) || obj.url.match(/\.(jpg|jpeg|png|gif|webp|bmp)/i)) type = "image";
+      else type = "other";
+
+      results.push({ url: obj.url, type, source: obj.note || "detected" });
+    }
+
+    // Capture console messages
+    page.on("console", msg => {
+      try {
+        const txt = msg.text();
+        if (!txt.startsWith("CAPTURE_MEDIA::")) return;
+        const payload = JSON.parse(txt.replace(/^CAPTURE_MEDIA::/, ""));
+        pushResult(payload);
+      } catch(e){}
+    });
+
+    // Capture network responses
+    page.on("response", response => {
+      try {
+        const rurl = response.url().replace(/&bytestart=\d+&byteend=\d+/gi, "");
+        const ct = response.headers()["content-type"] || "";
+        if (ct.includes("video") || ct.includes("audio") || ct.includes("image") || MEDIA_EXT_RE.test(rurl)) {
+          pushResult({ url: rurl, type: ct.split("/")[0] || "other", note: "network" });
+        }
+      } catch(e){}
+    });
+
+    // Navigate to page
+    await page.goto(url, { waitUntil: "networkidle2", timeout: 30000 }).catch(()=>{});
+    await new Promise(r => setTimeout(r, 1500));
+
+    // Grab DOM media
+    const domMedia = await page.evaluate(() => {
+      const out = [];
+      document.querySelectorAll("video, audio, img, source").forEach(el => {
+        if (el.src) out.push({ url: el.src, type: el.tagName.toLowerCase(), note: "dom-final" });
+      });
+      return out;
+    });
+    domMedia.forEach(pushResult);
+
+    await page.close();
+
+    // Priority sort
+    const priority = [], normal = [];
+    results.forEach(r => {
+      if (PRIORITY_DOMAINS.some(d => r.url.includes(d))) priority.push(r);
+      else normal.push(r);
+    });
+
+    res.json({ results: [...priority, ...normal] });
+
+  } catch (err) {
+    console.error("Error /extract:", err.stack || err);
+    res.json({ results: [] });
+  }
 });
+
+app.listen(PORT, () => console.log(`✅ Server running at http://localhost:${PORT}`));
 
