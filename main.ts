@@ -1,13 +1,9 @@
 // biharfm_deno_server.js
-// Deno YouTube Extractor + Smart Language/Era Detector + BiharFM Signaling Server
+// Deno YouTube Extractor + Smart Language/Festival/Era Detector + Diverse Shuffle Engine
 
-// Configuration (Max listeners per room)
 const MAX_PER_ROOM = 4; 
 
-// Memory state (Deno isolates memory across sessions)
-// clientId -> { ws, role, customId, roomId }
 const clients = new Map();
-// roomId -> Set(clientId)
 const rooms = new Map();
 
 function genRoomId() {
@@ -16,7 +12,7 @@ function genRoomId() {
 }
 
 function safeSend(ws, obj) {
-  if (!ws || ws.readyState !== 1) return; // 1 means OPEN in WebSockets
+  if (!ws || ws.readyState !== 1) return;
   try { 
     ws.send(JSON.stringify(obj)); 
   } catch (_) {}
@@ -48,10 +44,32 @@ function removeFromRoom(clientId) {
   delete c.roomId;
 }
 
-// ---------------- 1. GOOGLE TRANSLATE: LANGUAGE & ERA DETECTOR ----------------
+// ---------------- 1. ARRAY SHUFFLE HELPER (वैराइटी के लिए) ----------------
+function shuffleArray(array) {
+  const arr = [...array];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// ---------------- 2. GOOGLE TRANSLATE: LANGUAGE, ERA & FESTIVAL DETECTOR ----------------
 async function detectLanguageAndEra(query) {
   let language = "bhojpuri";
   let eraQuery = "superhit popular video songs";
+
+  const now = new Date();
+  const month = now.getMonth() + 1; // 1 to 12
+  const currentYear = now.getFullYear();
+
+  // महीने के हिसाब से स्वचालित त्योहार पहचानना
+  let seasonalKeyword = "";
+  if (month === 3) seasonalKeyword = "holi special hit songs";
+  else if (month === 8) seasonalKeyword = "rakhi Independence day songs";
+  else if (month === 10 || month === 11) seasonalKeyword = "diwali chhath pooja navratri hit songs";
+  else if (month === 12 || month === 1) seasonalKeyword = "new year dj party hits";
+  else seasonalKeyword = `new hit song ${currentYear} trending`;
 
   try {
     const res = await fetch(
@@ -60,7 +78,6 @@ async function detectLanguageAndEra(query) {
     const data = await res.json();
     const detectedLang = data?.[2] || "";
 
-    // Language Mapping
     const langMap = {
       bho: "bhojpuri",
       mag: "bhojpuri",
@@ -80,28 +97,26 @@ async function detectLanguageAndEra(query) {
 
     language = langMap[detectedLang] || "bhojpuri";
 
-    // समय और ज़माना पहचानना (Era / Decade Detection)
     const lower = query.toLowerCase();
     if (/1990s|90s|90|purana|old|classic/i.test(lower)) {
       eraQuery = "90s 80s classic evergreen hits";
     } else if (/2000s|2000|2005|2010/i.test(lower)) {
       eraQuery = "2000s superhit retro hits";
-    } else if (/new|latest|2025|2026|recent|trending/i.test(lower)) {
-      const currentYear = new Date().getFullYear();
-      eraQuery = `new hit song ${currentYear} trending`;
+    } else if (/holi|छठ|diwali|navratri|festival|parv/i.test(lower)) {
+      eraQuery = "festival special superhit songs";
     } else {
-      eraQuery = "superhit popular video songs";
+      eraQuery = seasonalKeyword;
     }
 
   } catch (_) {
     language = "bhojpuri";
-    eraQuery = "superhit video songs";
+    eraQuery = seasonalKeyword;
   }
 
   return { language, eraQuery };
 }
 
-// ---------------- 2. HELPER: YouTube Fetcher & Scraper (No API Key Required) ----------------
+// ---------------- 3. YOUTUBE CUSTOM SCRAPER (No Key Required) ----------------
 async function fetchYouTubeSearchResults(searchQuery) {
   try {
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchQuery)}`;
@@ -172,12 +187,10 @@ function handleWebSocket(req) {
     const entry = clients.get(id);
     if (!entry) return;
 
-    // --- Registration ---
     if (type === "register") {
       entry.role = role || "listener";
       if (customId) entry.customId = customId;
 
-      // --- Listener logic ---
       if (entry.role === "listener") {
         let roomId = findRoomWithSpace();
         if (!roomId) roomId = genRoomId();
@@ -185,7 +198,6 @@ function handleWebSocket(req) {
         safeSend(ws, { type: "room-assigned", roomId });
         console.log(`listener ${entry.customId} -> ${roomId} (${rooms.get(roomId).size}/${MAX_PER_ROOM})`);
 
-        // Notify broadcaster(s)
         for (const [, c] of clients) {
           if (c.role === "broadcaster") {
             safeSend(c.ws, { type: "listener-joined", id, roomId });
@@ -193,7 +205,6 @@ function handleWebSocket(req) {
         }
       }
 
-      // --- Broadcaster logic ---
       if (entry.role === "broadcaster") {
         console.log("▶ broadcaster registered");
         const list = Array.from(rooms.entries()).map(([r, s]) => ({ roomId: r, count: s.size }));
@@ -202,14 +213,12 @@ function handleWebSocket(req) {
       return;
     }
 
-    // --- WebRTC signaling relay ---
     if (["offer", "answer", "candidate"].includes(type) && target) {
       const t = clients.get(target);
       if (t) safeSend(t.ws, { type, from: id, payload });
       return;
     }
 
-    // --- Metadata broadcast ---
     if (type === "metadata" && clients.get(id)?.role === "broadcaster") {
       for (const [_, c] of clients.entries()) {
         if (c.role === "listener") safeSend(c.ws, { type: "metadata", ...payload });
@@ -217,7 +226,6 @@ function handleWebSocket(req) {
       return;
     }
 
-    // --- Room message broadcast ---
     if (type === "room-message") {
       const c = clients.get(id);
       if (!c || !c.roomId) return;
@@ -263,17 +271,15 @@ Deno.serve(async (req) => {
     return new Response(null, { headers });
   }
 
-  // Upgrade HTTP to WebSocket for signaling if client requests it
   if (req.headers.get("upgrade") === "websocket") {
     return handleWebSocket(req);
   }
 
-  // Home Route
   if (pathname === "/") {
     return new Response(
       JSON.stringify({ 
         status: "running", 
-        message: "🎧 BiharFM ready. Connect via WebSocket for Signaling, or use /ytdlp and /search endpoints." 
+        message: "🎧 BiharFM ready. Dynamic Language, Era & Diverse Playlist Engine Active." 
       }, null, 2),
       { headers }
     );
@@ -374,18 +380,18 @@ Deno.serve(async (req) => {
     }
   }
 
-  // ---------------- SEARCH (/search) ----------------
-  if (pathname === "/search") {
+  // ---------------- SEARCH ROUTE (/search) ----------------
+  if (pathname === "/search1") {
     const rawQuery = searchParams.get("q");
     if (!rawQuery) {
       return new Response(JSON.stringify({ error: "Missing ?q=" }), { headers, status: 400 });
     }
 
     try {
-      // 1. भाषा और ज़माना पहचानें
+      // 1. भाषा, समय और फेस्टिवल का ऑटोमैटिक पता लगाएं
       const { language, eraQuery } = await detectLanguageAndEra(rawQuery);
 
-      // 2. कस्टम स्क्रेपर से दो सर्च एक साथ भेजें (No YouTube Key Required)
+      // 2. Parallel Search (सर्च किया गाना + उसी भाषा/त्योहार का कलेक्शन)
       const [exactResults, contextualResults] = await Promise.all([
         fetchYouTubeSearchResults(`${rawQuery} official video`),
         fetchYouTubeSearchResults(`${language} ${eraQuery}`)
@@ -401,10 +407,8 @@ Deno.serve(async (req) => {
 
         const titleLower = item.snippet.title.toLowerCase();
 
-        // 3a. रीमिक्स / लो-फि / स्टेटस वाले डुप्लीकेट्स फ़िल्टर करें
-        const isJunkDuplicate = /remix|lofi|slowed|reverb|status|8d audio|30 sec|shorts/i.test(titleLower);
-        
-        // 3b. मुख्य टाइटल के आधार पर समान गाने रिजेक्ट करें
+        // फालतू डुप्लीकेट्स (Shorts / Status / Lofi) हटाना
+        const isJunkDuplicate = /remix|lofi|slowed|reverb|status|30 sec|shorts/i.test(titleLower);
         const baseTitle = titleLower.split("|")[0].split("-")[0].trim();
 
         if (!seenTitles.has(baseTitle) && (!isJunkDuplicate || items.length === 0)) {
@@ -414,13 +418,14 @@ Deno.serve(async (req) => {
         }
       };
 
-      // 1. यूज़र के मुख्य सर्च से शुरुआती 2 से 4 सटीक (particular) परिणाम जोड़ें
-      exactResults.slice(0, 4).forEach(addValidItem);
+      // 1. यूज़र के खास सर्च से 2 से 3 सटीक रिजल्ट्स डालें
+      exactResults.slice(0, 3).forEach(addValidItem);
 
-      // 2. बाकी परिणाम पहचाने गए भाषा + ज़माने के सुपरहिट गानों से भरें
-      contextualResults.forEach(addValidItem);
+      // 2. बाकी गानों को रैंडमली मिक्स (Shuffle) करके डालें ताकि हर बार अलग और ढेरों गाने मिलें
+      const randomizedContextual = shuffleArray(contextualResults);
+      randomizedContextual.forEach(addValidItem);
 
-      // 3. अगर रिजल्ट्स कम हों तो बैकअप जोड़ें
+      // 3. बैकअप फ़िलर
       if (items.length < 5) {
         exactResults.forEach(addValidItem);
       }
