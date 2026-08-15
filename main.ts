@@ -1,5 +1,5 @@
 // biharfm_deno_server.js
-// Deno YouTube Extractor + Search + BiharFM Signaling Server (4-listener rooms)
+// Deno YouTube Extractor + Smart Language/Era Detector + BiharFM Signaling Server
 
 // Configuration (Max listeners per room)
 const MAX_PER_ROOM = 4; 
@@ -48,11 +48,66 @@ function removeFromRoom(clientId) {
   delete c.roomId;
 }
 
-// ---------------- HELPER: YouTube Fetcher & Scraper ----------------
+// ---------------- 1. GOOGLE TRANSLATE: LANGUAGE & ERA DETECTOR ----------------
+async function detectLanguageAndEra(query) {
+  let language = "bhojpuri";
+  let eraQuery = "superhit popular video songs";
+
+  try {
+    const res = await fetch(
+      `https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=en&dt=t&q=${encodeURIComponent(query)}`
+    );
+    const data = await res.json();
+    const detectedLang = data?.[2] || "";
+
+    // Language Mapping
+    const langMap = {
+      bho: "bhojpuri",
+      mag: "bhojpuri",
+      mai: "bhojpuri",
+      hi: "hindi",
+      pa: "punjabi",
+      hr: "haryanvi",
+      bn: "bengali",
+      ta: "tamil",
+      te: "telugu",
+      mr: "marathi",
+      gu: "gujarati",
+      en: "english",
+      ko: "kpop korean",
+      es: "spanish"
+    };
+
+    language = langMap[detectedLang] || "bhojpuri";
+
+    // समय और ज़माना पहचानना (Era / Decade Detection)
+    const lower = query.toLowerCase();
+    if (/1990s|90s|90|purana|old|classic/i.test(lower)) {
+      eraQuery = "90s 80s classic evergreen hits";
+    } else if (/2000s|2000|2005|2010/i.test(lower)) {
+      eraQuery = "2000s superhit retro hits";
+    } else if (/new|latest|2025|2026|recent|trending/i.test(lower)) {
+      const currentYear = new Date().getFullYear();
+      eraQuery = `new hit song ${currentYear} trending`;
+    } else {
+      eraQuery = "superhit popular video songs";
+    }
+
+  } catch (_) {
+    language = "bhojpuri";
+    eraQuery = "superhit video songs";
+  }
+
+  return { language, eraQuery };
+}
+
+// ---------------- 2. HELPER: YouTube Fetcher & Scraper (No API Key Required) ----------------
 async function fetchYouTubeSearchResults(searchQuery) {
   try {
     const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(searchQuery)}`;
-    const res = await fetch(searchUrl, { headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } });
+    const res = await fetch(searchUrl, { 
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)" } 
+    });
     const html = await res.text();
 
     const dataMatch = html.match(/ytInitialData\s*=\s*(\{.+?\});/s);
@@ -93,30 +148,6 @@ async function fetchYouTubeSearchResults(searchQuery) {
   } catch (_) {
     return [];
   }
-}
-
-// ---------------- HELPER: Festival & Language Aware Query Builder ----------------
-function buildSmartQuery(userQuery) {
-  const now = new Date();
-  const month = now.getMonth() + 1; // 1 to 12
-  const currentYear = now.getFullYear();
-
-  let festivalKeyword = "";
-  if (month === 3) festivalKeyword = "Holi special song";
-  else if (month === 8) festivalKeyword = "Independence Day Rakhi song";
-  else if (month === 10 || month === 11) festivalKeyword = "Diwali Navratri Garba song";
-  else if (month === 12 || month === 1) festivalKeyword = "New Year DJ party song";
-  else festivalKeyword = "hit trending song";
-
-  const lowerQuery = userQuery.toLowerCase().trim();
-  const genericTerms = ["hindi", "bhojpuri", "punjabi", "haryanvi", "song", "gaana", "songs"];
-
-  // अगर यूजर सिर्फ जेनेरिक शब्द (जैसे "hindi" या "bhojpuri") टाइप करता है
-  if (genericTerms.includes(lowerQuery)) {
-    return `${userQuery} ${festivalKeyword} ${currentYear} latest`;
-  }
-
-  return userQuery;
 }
 
 // Handle BiharFM WebSocket Connections
@@ -351,39 +382,29 @@ Deno.serve(async (req) => {
     }
 
     try {
-      const smartQuery = buildSmartQuery(rawQuery);
+      // 1. भाषा और ज़माना पहचानें
+      const { language, eraQuery } = await detectLanguageAndEra(rawQuery);
 
-      // 1. भाषा / शैली (Language/Genre) पहचानें
-      let languageOrGenre = "hindi";
-      if (/bhojpuri|भोजपुरी/i.test(rawQuery)) languageOrGenre = "bhojpuri";
-      else if (/punjabi|पंजाबी/i.test(rawQuery)) languageOrGenre = "punjabi";
-      else if (/haryanvi|हरयाणवी/i.test(rawQuery)) languageOrGenre = "haryanvi";
-
-      const currentYear = new Date().getFullYear();
-
-      // 2. एक साथ (Parallel) दो YouTube Requests भेजें:
-      // A: यूजर का मुख्य गाना
-      // B: उसी भाषा के उसी समय के अन्य सुपरहिट गाने
-      const [exactResults, trendingResults] = await Promise.all([
-        fetchYouTubeSearchResults(`${smartQuery} official video`),
-        fetchYouTubeSearchResults(`${languageOrGenre} new hit song ${currentYear} trending`)
+      // 2. कस्टम स्क्रेपर से दो सर्च एक साथ भेजें (No YouTube Key Required)
+      const [exactResults, contextualResults] = await Promise.all([
+        fetchYouTubeSearchResults(`${rawQuery} official video`),
+        fetchYouTubeSearchResults(`${language} ${eraQuery}`)
       ]);
 
       const items = [];
       const seenVideoIds = new Set();
       const seenTitles = new Set();
 
-      // 3. फ़िल्टरिंग और डुप्लीकेट हटाने का स्मार्ट लॉजिक
       const addValidItem = (item) => {
         const vId = item.id?.videoId;
         if (!vId || seenVideoIds.has(vId)) return;
 
         const titleLower = item.snippet.title.toLowerCase();
 
-        // 3a. रीमिक्स / लो-फि / स्टेटस वाले फालतू डुप्लीकेट्स को फ़िल्टर करें
-        const isJunkDuplicate = /remix|lofi|slowed|reverb|status|8d audio|30 sec|full screen status/i.test(titleLower);
+        // 3a. रीमिक्स / लो-फि / स्टेटस वाले डुप्लीकेट्स फ़िल्टर करें
+        const isJunkDuplicate = /remix|lofi|slowed|reverb|status|8d audio|30 sec|shorts/i.test(titleLower);
         
-        // 3b. मुख्य टाइटल के आधार पर समान गाने को रिजेक्ट करें
+        // 3b. मुख्य टाइटल के आधार पर समान गाने रिजेक्ट करें
         const baseTitle = titleLower.split("|")[0].split("-")[0].trim();
 
         if (!seenTitles.has(baseTitle) && (!isJunkDuplicate || items.length === 0)) {
@@ -393,24 +414,28 @@ Deno.serve(async (req) => {
         }
       };
 
-      // पहले मुख्य गाने के 1-2 बेस्ट रिजल्ट्स डालें
-      exactResults.slice(0, 3).forEach(addValidItem);
+      // 1. यूज़र के मुख्य सर्च से शुरुआती 2 से 4 सटीक (particular) परिणाम जोड़ें
+      exactResults.slice(0, 4).forEach(addValidItem);
 
-      // फिर उसी भाषा/समय के सुपरहिट गाने लिस्ट में नीचे जोड़ें
-      trendingResults.forEach(addValidItem);
+      // 2. बाकी परिणाम पहचाने गए भाषा + ज़माने के सुपरहिट गानों से भरें
+      contextualResults.forEach(addValidItem);
 
-      // अगर फ़िल्टरिंग के कारण बहुत कम गाने बचे तो बैकअप में ओरिजिनल सर्च रिजल्ट्स भी जोड़ लें
+      // 3. अगर रिजल्ट्स कम हों तो बैकअप जोड़ें
       if (items.length < 5) {
         exactResults.forEach(addValidItem);
       }
 
       const response = {
         kind: "youtube#searchListResponse",
-        pageInfo: { totalResults: items.length, resultsPerPage: 20 },
+        pageInfo: {
+          totalResults: items.length,
+          resultsPerPage: 20
+        },
         items: items.slice(0, 20),
       };
 
       return new Response(JSON.stringify(response, null, 2), { headers });
+
     } catch (err) {
       return new Response(JSON.stringify({ error: err.message }), { headers, status: 500 });
     }
